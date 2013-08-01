@@ -53,8 +53,8 @@ exit 0
 endef
 
 define Build/Prepare
-        mkdir -p $(PKG_BUILD_DIR)
-        $(CP) ./src/* $(PKG_BUILD_DIR)/
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/* $(PKG_BUILD_DIR)/
 endef
 
 define Build/Compile
