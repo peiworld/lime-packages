@@ -7,37 +7,49 @@ local iw  = require "iwinfo"
 
 local x = uci:cursor()
 
-local function node_id()
-	local dev = assert(x:get("wbm", "network", "primary_dev"))
-	local mac = assert(fs.readfile("/sys/class/net/"..dev.."/address"))
-	local hash = crc.hash(mac)
-	return math.floor(hash / 256), hash % 256
+local function split(string, sep)
+	local ret = {}
+	for token in string.gmatch(string, "[^"..sep.."]+") do
+		table.insert(ret, token)
+	end
+	return ret
 end
+
+local function node_id()
+	local dev = assert(x:get("lime", "network", "primary_dev"))
+	local mac = assert(fs.readfile("/sys/class/net/"..dev.."/address"))
+	local t = split(mac, ":")
+	local r1, r2, r3 = t[#t-2], t[#t-1], t[#t]
+	return r1, r2, r3
+end
+
+-- TODO: implement
+--[[local function network_id()
+	local N1, N2, N3 = hash3bytes(network_essid)
+end]]--
 
 local function generate_address(p, n)
 	local id = (n * 10) + p
-	local r1, r2 = node_id()
-	local ipv4_template = assert(x:get("wbm", "network", "ipv4_net"))
-	local ipv6_template = assert(x:get("wbm", "network", "ipv6_net"))
-	local mac_template  = assert(x:get("wbm", "network", "mac_net"))
+	local r1, r2, r3 = node_id()
+	local ipv4_template = assert(x:get("lime", "network", "ipv4_net"))
+	local ipv6_template = assert(x:get("lime", "network", "ipv6_net"))
 
 	local function hex(x) return string.format("%02x", x) end
 
-	return ipv4_template:gsub("P", id):gsub("R1", r1):gsub("R2", r2),
-	       ipv6_template:gsub("P", id):gsub("R1", hex(r1)):gsub("R2", hex(r2)), -- XXX: id should be hex coded but for backwards compat keep it decimal
-	       mac_template:gsub("P", hex(id)):gsub("R1", hex(r1)):gsub("R2", hex(r2))
+	return ipv4_template:gsub("R1", r1):gsub("R2", r2):gsub("R3", r3),
+	       ipv6_template:gsub("R1", hex(r1)):gsub("R2", hex(r2)):gsub("R3", hex(r3))
 end
 
 local function generate_ssid()
-	local id = assert(x:get("wbm", "wireless", "ssid"))
-	local r1, r2 = node_id()
+	local id = assert(x:get("lime", "wireless", "ssid"))
+	local r1, r2, r3 = node_id()
 
-	return string.format("%s-%02x%02x", id, r1, r2)
+	return string.format("%02x%02x%02x.%s", r1, r2, r3, id)
 end
 
 local function set_hostname()
-	local r1, r2 = node_id()
-	local hostname = string.format("wbm-%02x%02x", r1, r2)
+	local r1, r2, r3 = node_id()
+	local hostname = string.format("%02x%02x%02x", r1, r2, r3)
 
 	x:foreach("system", "system", function(s)
 		x:set("system", s[".name"], "hostname", hostname)
@@ -53,68 +65,59 @@ local function printf(fmt, ...)
 end
 
 function main()
-	local protocols = assert(x:get("wbm", "network", "protos"))
-	local vlan_base = assert(x:get("wbm", "network", "vlan_tag_start"))
-	local o11s_ifs = x:get("wbm", "network", "o11s_ifs") or ""
-	local r1, r2 = node_id()
+	local protocols = assert(x:get("lime", "network", "protos"))
+	local vlans = assert(x:get("lime", "network", "vlans"))
+	local r1, r2, r3 = node_id()
 	local batch = { }
-
-
-	print("Clearing wireless config...")
-	x:foreach("wireless", "wifi-iface", function(s) x:delete("wireless", s[".name"]) end)
 
 	print("Clearing network config...")
 	x:foreach("network", "interface", function(s)
-		if s[".name"]:match("^wbm%d_") or s[".name"]:match("^lan_") then
+		if s[".name"]:match("^lime_") then
 			x:delete("network", s[".name"])
 		end
 	end)
 
-	x:foreach("network", "switch_vlan", function(s) x:delete("network", s[".name"]) end)
-	x:foreach("network", "switch", function(s) x:delete("network", s[".name"]) end)
+	x:set("network", "lan", "ifname", "eth0 bat0")
 
-	x:delete("network", "wan")
-	x:delete("network", "wan6")
-	x:delete("network", "lan", "type")
-	x:set("network", "lan", "ifname", "eth0")
-
+	-- Add vlan interfaces on top of ethernet, for each proto. Eg. lime_batadv_eth
 	local n
 	for n = 1, #protocols do
-		local net = "lan_" .. protocols[n]
-		local ifn = string.format("@lan.%d", vlan_base + n - 1)
+		local net = "lime_" .. protocols[n] .. "_eth"
+		local ifn = string.format("@eth1.%d", vlans[n])
 		local v4, v6 = generate_address(n, 0)
 
 		x:set("network", net, "interface")
-		x:set("network", net, "proto", "static")
 		x:set("network", net, "ifname", ifn)
-		x:set("network", net, "ipaddr", v4)
-		x:set("network", net, "ip6addr", v6)
+		x:set("network", net, "proto", "none")
+		x:set("network", net, "auto", "1")
 
-		local cmd = string.format("sh /etc/wbm/protos/%s.sh add %s %s %s %s %d %d",
-			protocols[n], net, ifn, v4, v6, r1, r2)
+		local cmd = string.format("sh /etc/lime/protos/%s.sh add %s %s %s %s %d %d %d",
+			protocols[n], net, ifn, v4, v6, r1, r2, r3)
 
 		batch[#batch+1] = cmd
 	end
 
-	x:save("6relayd")
 	x:save("wireless")
 	x:save("network")
-	x:commit("6relayd")
 	x:commit("wireless")
 	x:commit("network")
+
+	print("Clearing wireless config...")
+	x:foreach("wireless", "wifi-iface", function(s) x:delete("wireless", s[".name"]) end)
 
 	print("Preparing protocols...")
 	local _, p
 	for _, p in ipairs(protocols) do
-		local cmd = string.format("sh /etc/wbm/protos/%s.sh prepare", p)
+		local cmd = string.format("sh /etc/lime/protos/%s.sh prepare", p)
 		printf("-> Calling %s", cmd)
 		os.execute(cmd)
 	end
 
 	print("Defining wireless networks...")
-	local channel2 = assert(x:get("wbm", "wireless", "channel_2ghz"))
-	local channel5 = assert(x:get("wbm", "wireless", "channel_5ghz"))
-	local mcast_rate = assert(x:get("wbm", "wireless", "mcast_rate"))
+	local channel2 = assert(x:get("lime", "wireless", "mesh_channel_2ghz"))
+	local channel5 = assert(x:get("lime", "wireless", "mesh_channel_5ghz"))
+	local mcast_rate_2 = assert(x:get("lime", "wireless", "mesh_mcast_rate_2ghz"))
+	local mcast_rate_5 = assert(x:get("lime", "wireless", "mesh_mcast_rate_5ghz"))
 	local wifi_num = 1
 
 	x:foreach("wireless", "wifi-device", function(s)
@@ -123,10 +126,9 @@ function main()
 
 		local is_5ghz = iw[t].hwmodelist(s[".name"]).a
 		local ch = table.remove(is_5ghz and channel5 or channel2, 1)
-		local id = string.format("wbm%d", wifi_num)
+		local mcr = is_5ghz and mcast_rate_5 or mcast_rate_2
+		local id = string.format("mesh%d", wifi_num)
 		local net = id .. "_base"
-		local ifn = string.format("wbm%d", wifi_num)
-		local o11sif = string.find(o11s_ifs, ifn)
 
 		if not ch then
 			printf("-> No channel defined for %dGHz %s", is_5ghz and 5 or 2, s[".name"])
@@ -146,43 +148,34 @@ function main()
 			end
 		end
 
-		local _, _, mac = generate_address(0, wifi_num)
-
 		x:set("wireless", s[".name"], "disabled", 0)
+
 		x:set("wireless", id, "wifi-iface")
+		x:set("wireless", id, "mode", "adhoc")
 		x:set("wireless", id, "device", s[".name"])
 		x:set("wireless", id, "network", net)
-		x:set("wireless", id, "ifname", ifn)
-		x:set("wireless", id, "mcast_rate", mcast_rate)
-		x:set("wireless", id, "macaddr", mac)
+		x:set("wireless", id, "mcast_rate", mcr)
+		x:set("wireless", id, "ssid", generate_ssid())
+		x:set("wireless", id, "bssid", assert(x:get("lime", "wireless", "mesh_bssid")))
 
 		x:set("network", net, "interface")
 		x:set("network", net, "proto", "none")
 
-		if o11sif then
-			x:set("wireless", id, "mode", "mesh")
-			x:set("wireless", id, "mesh_id", "battlemesh")
-		else
-			x:set("wireless", id, "mode", "adhoc")
-			x:set("wireless", id, "ssid", generate_ssid())
-			x:set("wireless", id, "bssid", assert(x:get("wbm", "wireless", "bssid")))
-		end
 
+		-- Add vlan interfaces on top of wlans, for each proto. Eg. lime_batadv_mesh0
 		local n
 		for n = 1, #protocols do
 			local v4, v6 = generate_address(n, wifi_num)
 
-			net = id .. "_" .. ((o11sif and "o11s") or protocols[n])
+			net = "lime_" .. protocols[n] .. "_" .. id
 			x:set("network", net, "interface")
 			x:set("network", net, "proto", "static")
-			x:set("network", net, "ifname", string.format("@%s_base.%d", id, n + vlan_base - 1))
-			x:set("network", net, "ipaddr", v4)
+			x:set("network", net, "ifname", string.format("@%s_base.%d", id, vlans[n]))
 			x:set("network", net, "ip6addr", v6)
 
-			if o11sif then break end
-
-			local cmd = string.format("sh /etc/wbm/protos/%s.sh add %s %s.%d %s %s",
-				protocols[n], net, ifn, n + vlan_base - 1, v4, v6)
+			print("blah",protocols[n], net, ifn, vlans[n], v4, v6)
+			local cmd = string.format("sh /etc/lime/protos/%s.sh add %s %s.%d %s %s",
+				protocols[n], net, ifn, vlans[n], v4, v6)
 
 			batch[#batch+1] = cmd
 		end
